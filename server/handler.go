@@ -24,7 +24,12 @@ func esmHandler() rex.Handle {
 
 	return func(ctx *rex.Context) interface{} {
 		pathname := ctx.Path.String()
-
+		remoteAddr := ctx.R.RemoteAddr
+		fmt.Printf("%+v\n", ctx.R.RemoteAddr)
+		//只允许本地地址访问
+		if !strings.HasPrefix(remoteAddr, "127.0.0.1") && !strings.HasPrefix(remoteAddr, "[::1]") {
+			return rex.Status(404, "not found")
+		}
 		// ban malicious requests
 		if strings.HasPrefix(pathname, ".") || strings.HasSuffix(pathname, ".php") {
 			return rex.Status(404, "not found")
