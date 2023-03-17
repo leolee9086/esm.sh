@@ -10,9 +10,7 @@ set GOOS=windows
 set GOARCH=amd64
 go build --tags fts5 -v -o "./kernel/esmsh-win64.exe" 
 
-set GOOS=windows
-set GOARCH=386
-go build --tags fts5 -v -o "./kernel/esmsh-win32.exe"
+goto end
 set CGO_ENABLED=0
 set GOOS=darwin
 set GOARCH=amd64
@@ -29,7 +27,7 @@ go build --tags fts5 -v -o "./kernel-linux/esmsh"
 set GOOS=linux
 set GOARCH=arm64
 go build --tags fts5 -v -o "./kernel-linux-arm64/esmsh" 
-
+:end
 
 
 

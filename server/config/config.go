@@ -28,7 +28,10 @@ type Config struct {
 	NpmToken         string  `json:"npmToken,omitempty"`
 	NpmCDN           string  `json:"npmCDN,omitempty"`
 	BackupNpmCDN     string  `json:"backupNpmCDN,omitempty"`
-	NoCompress       bool    `json:"noCompress,omitempty"`
+	PluginPath       string  `json:"pluginPath,omitempty"`
+	APIPath          string  `json:"apiPath,omitempty"`
+
+	NoCompress bool `json:"noCompress,omitempty"`
 }
 
 type BanList struct {
@@ -137,6 +140,8 @@ func Default() *Config {
 		LogDir:           path.Join(workDir, "log"),
 		LogLevel:         "info",
 		NpmCDN:           "https://esm.sh",
+		PluginPath:       path.Join(workDir, "plugins"),
+		APIPath:          path.Join(workDir, "noobApi"),
 	}
 }
 

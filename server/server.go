@@ -148,9 +148,36 @@ func Serve(efs EmbedFS) {
 			ExposedHeaders:   []string{"X-TypeScript-Types"},
 			AllowCredentials: false,
 		}),
+		//这里进行了一点修改，不允许远程访问esm的服务
+	)
+	rex.Query(
+		"plugin/*", func(ctx *rex.Context) interface{} {
+			pathname := ctx.Path.String()
+			pathname = strings.TrimPrefix(pathname, "/plugin/")
+			return rex.FS(cfg.PluginPath, pathname)
+		},
+	)
+	rex.Query(
+		"siyuan/*", func(ctx *rex.Context) interface{} {
+			ctx.SetHeader("Content-Type", "application/javascript; charset=utf-8")
+			pathname := ctx.Path.String()
+			pathname = strings.TrimPrefix(pathname, "/siyuan/")
+			fmt.Println(pathname)
+			fmt.Println(cfg.APIPath)
+			fmt.Println(cfg.PluginPath)
+
+			return rex.FS(cfg.APIPath, pathname)
+		},
+	)
+	rex.Query(
+		"siyuan", func(ctx *rex.Context) interface{} {
+			ctx.SetHeader("Content-Type", "application/javascript; charset=utf-8")
+			return rex.FS(cfg.APIPath, "index.js")
+		},
+	)
+	rex.Query("deps/*",
 		esmHandler(),
 	)
-
 	C := rex.Serve(rex.ServerConfig{
 		Port: uint16(cfg.Port),
 		TLS: rex.TLSConfig{
