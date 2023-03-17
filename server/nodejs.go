@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ije/esm.sh/server/storage"
+	"github.com/esm-dev/esm.sh/server/storage"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/ije/gox/utils"
@@ -25,7 +25,7 @@ import (
 )
 
 // ref https://github.com/npm/validate-npm-package-name
-var npmNaming = valid.Validator{valid.FromTo{'a', 'z'}, valid.FromTo{'0', '9'}, valid.Eq('_'), valid.Eq('.'), valid.Eq('-')}
+var npmNaming = valid.Validator{valid.FromTo{'a', 'z'}, valid.FromTo{'A', 'Z'}, valid.FromTo{'0', '9'}, valid.Eq('.'), valid.Eq('-'), valid.Eq('_')}
 
 var builtInNodeModules = map[string]bool{
 	"assert":              true,
@@ -190,6 +190,7 @@ type NpmPackageTemp struct {
 	PeerDependencies map[string]string      `json:"peerDependencies,omitempty"`
 	Imports          map[string]interface{} `json:"imports,omitempty"`
 	DefinedExports   interface{}            `json:"exports,omitempty"`
+	Deprecated       interface{}            `json:"deprecated,omitempty"`
 }
 
 func (a *NpmPackageTemp) ToNpmPackage() *NpmPackage {
@@ -210,6 +211,12 @@ func (a *NpmPackageTemp) ToNpmPackage() *NpmPackage {
 			}
 		}
 	}
+	deprecated := ""
+	if a.Deprecated != nil {
+		if s, ok := a.Deprecated.(string); ok {
+			deprecated = s
+		}
+	}
 	return &NpmPackage{
 		Name:             a.Name,
 		Version:          a.Version,
@@ -225,6 +232,7 @@ func (a *NpmPackageTemp) ToNpmPackage() *NpmPackage {
 		PeerDependencies: a.PeerDependencies,
 		Imports:          a.Imports,
 		DefinedExports:   a.DefinedExports,
+		Deprecated:       deprecated,
 	}
 }
 
@@ -244,6 +252,7 @@ type NpmPackage struct {
 	PeerDependencies map[string]string
 	Imports          map[string]interface{}
 	DefinedExports   interface{}
+	Deprecated       string
 }
 
 func (a *NpmPackage) UnmarshalJSON(b []byte) error {
@@ -347,24 +356,22 @@ func fetchPackageInfo(name string, version string) (info NpmPackage, err error) 
 	if version == "" {
 		version = "latest"
 	}
-	id := fmt.Sprintf("npm:%s@%s", name, version)
 
-	// wait lock release
-	for {
-		_, ok := lock.Load(id)
-		if !ok {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	cacheKey := fmt.Sprintf("npm:%s@%s", name, version)
 
-	lock.Store(id, struct{}{})
-	defer lock.Delete(id)
+	mutex, loaded := lock.LoadOrStore(cacheKey, &sync.Mutex{})
+
+	log.Debugf("fetch lock: %s, loaded(%v)", cacheKey, loaded)
+	mutex.(*sync.Mutex).Lock()
+	defer func() {
+		log.Debugf("fetch  unlock: %s", cacheKey)
+		mutex.(*sync.Mutex).Unlock()
+	}()
 
 	// check cache firstly
 	if cache != nil {
 		var data []byte
-		data, err = cache.Get(id)
+		data, err = cache.Get(cacheKey)
 		if err == nil && json.Unmarshal(data, &info) == nil {
 			return
 		}
@@ -392,22 +399,15 @@ func fetchPackageInfo(name string, version string) (info NpmPackage, err error) 
 		err = fmt.Errorf("npm: package '%s' not found", name)
 		return
 	}
+
 	if resp.StatusCode != 200 {
 		ret, _ := ioutil.ReadAll(resp.Body)
 		err = fmt.Errorf("npm: could not get metadata of package '%s' (%s: %s)", name, resp.Status, string(ret))
 		return
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
-	if err == io.EOF {
-		err = nil
-	}
-	if err != nil {
-		return
-	}
-
 	var h NpmPackageVerions
-	err = json.Unmarshal(data, &h)
+	err = json.NewDecoder(resp.Body).Decode(&h)
 	if err != nil {
 		return
 	}
@@ -470,7 +470,7 @@ func fetchPackageInfo(name string, version string) (info NpmPackage, err error) 
 		if !isFullVersion {
 			ttl = 10 * time.Minute
 		}
-		cache.Set(id, utils.MustEncodeJSON(info), ttl)
+		cache.Set(cacheKey, utils.MustEncodeJSON(info), ttl)
 	}
 	return
 }
@@ -584,11 +584,30 @@ func installNodejs(dir string, version string) (err error) {
 	return
 }
 
+var addingLock sync.Map
+
 func yarnAdd(wd string, pkg Pkg) (err error) {
+	noCache := false
+	pkgNameFormat := fmt.Sprintf("%s@%s", pkg.Name, pkg.Version)
+
+	mutex, loaded := addingLock.LoadOrStore(pkgNameFormat, &sync.Mutex{})
+
+	log.Debugf("yarn add lock: %s, loaded(%v)", pkgNameFormat, loaded)
+	mutex.(*sync.Mutex).Lock()
+	defer func() {
+		log.Debugf("yarn add unlock: %s", pkgNameFormat)
+		mutex.(*sync.Mutex).Unlock()
+	}()
+
+	// file exist, skip install
+	if _, e := os.Stat(path.Join(wd, ".yarn_added")); e == nil {
+		return
+	}
+
 	for i := 0; i < 3; i++ {
-		err = runYarnAdd(wd, fmt.Sprintf("%s@%s", pkg.Name, pkg.Version))
+		err = runYarnAdd(wd, noCache, pkgNameFormat)
 		if err == nil && !fileExists(path.Join(wd, "node_modules", pkg.Name, "package.json")) {
-			yarnCacheClean(pkg.Name)
+			noCache = true
 			err = fmt.Errorf("yarnAdd(%s): package.json not found", pkg)
 		}
 		if err == nil {
@@ -601,7 +620,7 @@ func yarnAdd(wd string, pkg Pkg) (err error) {
 	return
 }
 
-func runYarnAdd(wd string, packages ...string) (err error) {
+func runYarnAdd(wd string, noCache bool, packages ...string) (err error) {
 	if len(packages) > 0 {
 		start := time.Now()
 		args := []string{
@@ -610,18 +629,20 @@ func runYarnAdd(wd string, packages ...string) (err error) {
 			"--ignore-engines",
 			"--ignore-platform",
 			"--ignore-scripts",
-			"--ignore-workspace-root-check",
 			"--no-bin-links",
-			"--no-lockfile",
 			"--no-node-version-check",
 			"--no-progress",
 			"--non-interactive",
 			"--silent",
 			"--registry=" + cfg.NpmRegistry,
 		}
-		yarnCacheDir := os.Getenv("YARN_CACHE_DIR")
-		if yarnCacheDir != "" {
-			args = append(args, "--cache-folder", yarnCacheDir)
+		if noCache {
+			args = append(args, "--cache-folder", path.Join(wd, ".yarn_cache"))
+		} else {
+			yarnCacheDir := os.Getenv("YARN_CACHE_DIR")
+			if yarnCacheDir != "" {
+				args = append(args, "--cache-folder", yarnCacheDir)
+			}
 		}
 		yarnMutex := os.Getenv("YARN_MUTEX")
 		if yarnMutex != "" {
@@ -636,28 +657,11 @@ func runYarnAdd(wd string, packages ...string) (err error) {
 		if err != nil {
 			return fmt.Errorf("yarn add %s: %s", strings.Join(packages, ","), string(output))
 		}
+
+		os.Create(path.Join(wd, ".yarn_added"))
 		log.Debug("yarn add", strings.Join(packages, ","), "in", time.Since(start))
 	}
 	return
-}
-
-func yarnCacheClean(packages ...string) {
-	if len(packages) > 0 {
-		args := []string{"cache", "clean"}
-		yarnCacheDir := os.Getenv("YARN_CACHE_DIR")
-		if yarnCacheDir != "" {
-			args = append(args, "--cache-folder", yarnCacheDir)
-		}
-		yarnMutex := os.Getenv("YARN_MUTEX")
-		if yarnMutex != "" {
-			args = append(args, "--mutex", yarnMutex)
-		}
-		cmd := exec.Command("yarn", append(args, packages...)...)
-		_, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Warnf("yarn cache clean %s: %s", strings.Join(packages, ","), err)
-		}
-	}
 }
 
 // ref https://github.com/npm/validate-npm-package-name

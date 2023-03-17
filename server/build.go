@@ -2,8 +2,6 @@ package server
 
 import (
 	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -15,7 +13,6 @@ import (
 	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
-	"github.com/ije/gox/crypto/rs"
 	"github.com/ije/gox/utils"
 )
 
@@ -116,9 +113,7 @@ func (task *BuildTask) Build() (esm *ESM, err error) {
 	}
 
 	if task.wd == "" {
-		hasher := sha1.New()
-		hasher.Write([]byte(task.ID()))
-		task.wd = path.Join(os.TempDir(), fmt.Sprintf("esm-build-%s-%s", hex.EncodeToString(hasher.Sum(nil)), rs.Hex.String(8)))
+		task.wd = path.Join(os.TempDir(), fmt.Sprintf("esm-build-%s-%s", task.Pkg.Name, task.Pkg.Version))
 		ensureDir(task.wd)
 
 		if cfg.NpmToken != "" {
@@ -133,12 +128,13 @@ func (task *BuildTask) Build() (esm *ESM, err error) {
 		}
 	}
 
-	defer func() {
-		err := os.RemoveAll(task.wd)
-		if err != nil {
-			log.Warnf("clean build(%s) dir: %v", task.ID(), err)
-		}
-	}()
+	// TODO: Remove node_modules of the idle working dir
+	// 	defer func() {
+	// 		err := os.RemoveAll(task.wd)
+	// 		if err != nil {
+	// 			log.Warnf("clean build(%s) dir: %v", task.ID(), err)
+	// 		}
+	// 	}()
 
 	task.stage = "install"
 	err = yarnAdd(task.wd, task.Pkg)
@@ -149,11 +145,11 @@ func (task *BuildTask) Build() (esm *ESM, err error) {
 	return task.build(newStringSet())
 }
 
-func (task *BuildTask) build(marker *stringSet) (esm *ESM, err error) {
-	if marker.Has(task.ID()) {
+func (task *BuildTask) build(tracing *stringSet) (esm *ESM, err error) {
+	if tracing.Has(task.ID()) {
 		return
 	}
-	marker.Add(task.ID())
+	tracing.Add(task.ID())
 
 	task.stage = "init"
 	esm, npm, err := initModule(task.wd, task.Pkg, task.Target, task.DevMode)
@@ -250,7 +246,8 @@ func (task *BuildTask) build(marker *stringSet) (esm *ESM, err error) {
 		"global.process.env.NODE_ENV": fmt.Sprintf(`"%s"`, nodeEnv),
 	}
 	externalDeps := newStringSet()
-	extraExternal := newStringSet()
+	implicitExternal := newStringSet()
+	browserExclude := map[string]*stringSet{}
 	esmResolverPlugin := api.Plugin{
 		Name: "esm-resolver",
 		Setup: func(build api.PluginBuild) {
@@ -285,8 +282,9 @@ func (task *BuildTask) build(marker *stringSet) (esm *ESM, err error) {
 						if name, ok := npm.Browser[spec]; ok {
 							if name == "" {
 								// browser exclude
-								return api.OnResolveResult{Namespace: "browser-exclude"}, nil
-							} else if strings.HasPrefix(name, "./") {
+								return api.OnResolveResult{Path: args.Path, Namespace: "browser-exclude"}, nil
+							}
+							if strings.HasPrefix(name, "./") {
 								specifier = path.Join(task.wd, "node_modules", npm.Name, name)
 							} else {
 								specifier = name
@@ -302,7 +300,7 @@ func (task *BuildTask) build(marker *stringSet) (esm *ESM, err error) {
 					}
 
 					// bundles all dependencies in `bundle` mode, apart from peer dependencies and `?external` query
-					if task.BundleMode && !extraExternal.Has(specifier) && !task.external.Has(specifier) {
+					if task.BundleMode && !implicitExternal.Has(specifier) && !task.external.Has(specifier) {
 						pkgName, _ := splitPkgPath(specifier)
 						if !builtInNodeModules[pkgName] {
 							_, ok := npm.PeerDependencies[pkgName]
@@ -432,37 +430,15 @@ func (task *BuildTask) build(marker *stringSet) (esm *ESM, err error) {
 			build.OnLoad(
 				api.OnLoadOptions{Filter: ".*", Namespace: "browser-exclude"},
 				func(args api.OnLoadArgs) (ret api.OnLoadResult, err error) {
-					contents := "export default undefined;"
+					contents := "export default null;"
+					if exports, ok := browserExclude[args.Path]; ok {
+						for _, name := range exports.Values() {
+							contents = fmt.Sprintf("%sexport const %s = null;", contents, name)
+						}
+					}
 					return api.OnLoadResult{Contents: &contents, Loader: api.LoaderJS}, nil
 				},
 			)
-
-			// workaround for prisma build
-			if npm.Name == "prisma" {
-				build.OnLoad(
-					api.OnLoadOptions{Filter: "\\/node_modules\\/"},
-					func(args api.OnLoadArgs) (ret api.OnLoadResult, err error) {
-						if strings.HasSuffix(args.Path, ".js") {
-							var file *os.File
-							file, err = os.Open(args.Path)
-							if err != nil {
-								return
-							}
-							defer file.Close()
-							buf := new(bytes.Buffer)
-							_, err = buf.ReadFrom(file)
-							if err != nil {
-								return
-							}
-							code := buf.String()
-							code = strings.ReplaceAll(code, "eval(`require('../package.json')`)", "require('../package.json')")
-							code = strings.ReplaceAll(code, "eval(\"__dirname\")", "__dirname")
-							code = strings.ReplaceAll(code, "eval(\"require.main === module\")", "import.meta.main")
-							ret.Contents = &code
-						}
-						return
-					})
-			}
 		},
 	}
 	esmBundlerPlugin := api.Plugin{
@@ -548,25 +524,35 @@ esbuild:
 		// mark the missing module as external to exclude it from the bundle
 		msg := result.Errors[0].Text
 		if strings.HasPrefix(msg, "Could not resolve \"") {
-			// but current package/module can not mark as external
+			// current package/module can not be marked as external
 			if strings.Contains(msg, fmt.Sprintf("Could not resolve \"%s\"", task.Pkg.ImportPath())) {
 				err = fmt.Errorf("Could not resolve \"%s\"", task.Pkg.ImportPath())
 				return
 			}
-			log.Warnf("esbuild(%s): %s", task.ID(), msg)
 			name := strings.Split(msg, "\"")[1]
-			if !extraExternal.Has(name) {
-				extraExternal.Add(name)
+			if !implicitExternal.Has(name) {
+				implicitExternal.Add(name)
 				externalDeps.Add(name)
 				goto esbuild
 			}
-		} else if strings.HasPrefix(msg, "No matching export in \"") && strings.Contains(msg, "for import \"default\"") {
-			input = &api.StdinOptions{
-				Contents:   fmt.Sprintf(`import "%s";export default null;`, task.Pkg.ImportPath()),
-				ResolveDir: task.wd,
-				Sourcefile: "index.js",
+		}
+		if strings.HasPrefix(msg, "No matching export in \"") {
+			a := strings.Split(msg, "\"")
+			if len(a) > 4 {
+				path, exportName := a[1], a[3]
+				if strings.HasPrefix(path, "browser-exclude:") && exportName != "default" {
+					path = strings.TrimPrefix(path, "browser-exclude:")
+					exports, ok := browserExclude[path]
+					if !ok {
+						exports = newStringSet()
+						browserExclude[path] = exports
+					}
+					if !exports.Has(exportName) {
+						exports.Add(exportName)
+						goto esbuild
+					}
+				}
 			}
-			goto esbuild
 		}
 		err = errors.New("esbuild: " + msg)
 		return
@@ -607,22 +593,7 @@ esbuild:
 						Version:   task.Pkg.Version,
 						Submodule: submodule,
 					}
-					subTask := &BuildTask{
-						wd:           task.wd, // use current `wd` to skip deps installation
-						BuildArgs:    task.BuildArgs,
-						CdnOrigin:    task.CdnOrigin,
-						BuildVersion: task.BuildVersion,
-						Pkg:          subPkg,
-						Target:       task.Target,
-						DevMode:      task.DevMode,
-					}
-					subTask.treeShaking = newStringSet()
-					_, err = subTask.build(marker)
-					if err != nil {
-						err = errors.New("can not build '" + submodule + "': " + err.Error())
-						return
-					}
-					importPath = task.getImportPath(subPkg, encodeBuildArgsPrefix(subTask.BuildArgs, subTask.Pkg.Name, false))
+					importPath = task.getImportPath(subPkg, encodeBuildArgsPrefix(task.BuildArgs, task.Pkg.Name, false))
 				}
 				// node builtin `buffer` module
 				if importPath == "" && name == "buffer" {
@@ -746,7 +717,7 @@ esbuild:
 					importPath = task.getImportPath(pkg, encodeBuildArgsPrefix(task.BuildArgs, pkg.Name, false))
 				}
 				if importPath == "" {
-					err = fmt.Errorf("Could not resolve \"%s\" (Imported by \"%s\")", name, task.Pkg.Name)
+					err = fmt.Errorf("could not resolve \"%s\" (Imported by \"%s\")", name, task.Pkg.Name)
 					return
 				}
 				buffer := bytes.NewBuffer(nil)
@@ -765,6 +736,7 @@ esbuild:
 							}
 							if err == nil {
 								dep, depNpm, err := initModule(task.wd, pkg, task.Target, task.DevMode)
+
 								if err == nil {
 									if bytes.HasPrefix(p, []byte{'.'}) {
 										// right shift to strip the object `key`
@@ -844,7 +816,9 @@ esbuild:
 						} else {
 							switch importName {
 							case "default":
-								fmt.Fprintf(buf, `import __%s$ from "%s";%s`, identifier, importPath, eol)
+								// Judge import members of commonjs package import at runtime due to lazy bundling of the module
+								fmt.Fprintf(buf, `import * as __%s$$$ from "%s";%s`, identifier, importPath, eol)
+								fmt.Fprintf(buf, `const __%s$ = __%s$$$.default ? __%s$$$.default : __%s$$$;%s`, identifier, identifier, identifier, identifier, eol)
 							case "*":
 								fmt.Fprintf(buf, `import * as __%s$ from "%s";%s`, identifier, importPath, eol)
 							case "all":
@@ -935,6 +909,12 @@ esbuild:
 						buf.Write(file.Contents)
 					}
 				}
+			}
+
+			// check if package is deprecated
+			p, e := fetchPackageInfo(task.Pkg.Name, task.Pkg.Version)
+			if e == nil && p.Deprecated != "" {
+				fmt.Fprintf(buf, `console.warn("[npm] %%cdeprecated%%c %s@%s: %s", "color:red", "");%s`, task.Pkg.Name, task.Pkg.Version, p.Deprecated, "\n")
 			}
 
 			// add sourcemap Url

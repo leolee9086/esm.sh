@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ije/esm.sh/server/storage"
+	"github.com/esm-dev/esm.sh/server/storage"
 
 	"github.com/ije/gox/utils"
 	"github.com/ije/rex"
@@ -46,12 +46,28 @@ func esmHandler() rex.Handle {
 			}
 		}
 
+		// pprof
+		// if strings.HasPrefix(pathname, "/debug/pprof/") {
+		// 	switch pathname {
+		// 	case "/debug/pprof/cmdline":
+		// 		return http.HandlerFunc(pprof.Cmdline)
+		// 	case "/debug/pprof/profile":
+		// 		return http.HandlerFunc(pprof.Profile)
+		// 	case "/debug/pprof/symbol":
+		// 		return http.HandlerFunc(pprof.Symbol)
+		// 	case "/debug/pprof/trace":
+		// 		return http.HandlerFunc(pprof.Trace)
+		// 	default:
+		// 		return http.HandlerFunc(pprof.Index)
+		// 	}
+		// }
+
 		// static routes
 		switch pathname {
 		case "/":
 			// return deno cli script if the `User-Agent` is "Deno"
 			if strings.HasPrefix(ctx.R.UserAgent(), "Deno/") {
-				cliTs, err := embedFS.ReadFile("server/embed/deno_cli.ts")
+				cliTs, err := embedFS.ReadFile("CLI.ts")
 				if err != nil {
 					return err
 				}
@@ -67,7 +83,7 @@ func esmHandler() rex.Handle {
 				return err
 			}
 			readme = bytes.ReplaceAll(readme, []byte("./server/embed/"), []byte(cfg.BasePath+"/embed/"))
-			readme = bytes.ReplaceAll(readme, []byte("./HOSTING.md"), []byte("https://github.com/ije/esm.sh/blob/master/HOSTING.md"))
+			readme = bytes.ReplaceAll(readme, []byte("./HOSTING.md"), []byte("https://github.com/esm-dev/esm.sh/blob/master/HOSTING.md"))
 			readme = bytes.ReplaceAll(readme, []byte("https://esm.sh"), []byte("{origin}"+cfg.BasePath))
 			readmeStrLit := utils.MustEncodeJSON(string(readme))
 			html := bytes.ReplaceAll(indexHTML, []byte("'# README'"), readmeStrLit)
@@ -147,17 +163,14 @@ func esmHandler() rex.Handle {
 			return rex.Status(404, "not found")
 		}
 
-		proto := "http"
-		if ctx.R.TLS != nil {
-			proto = "https"
-		}
-		reqOrigin := fmt.Sprintf("%s://%s", proto, ctx.R.Host)
-
-		var cdnOrigin string
-		if cfg.Origin != "" {
-			cdnOrigin = strings.TrimSuffix(cfg.Origin, "/")
-		} else {
-			cdnOrigin = reqOrigin
+		cdnOrigin := cfg.Origin
+		if cdnOrigin == "" {
+			proto := "http"
+			if ctx.R.TLS != nil {
+				proto = "https"
+			}
+			// use the request host as the origin if not set in config.json
+			cdnOrigin = fmt.Sprintf("%s://%s", proto, ctx.R.Host)
 		}
 
 		// serve embed assets
@@ -200,21 +213,22 @@ func esmHandler() rex.Handle {
 			outdatedBuildVer = a[1]
 		}
 
+		// check if the request is for the CLI, support version prefix
+		if strings.HasPrefix(ctx.R.UserAgent(), "Deno/") && pathname == "/" {
+			cliTs, err := embedFS.ReadFile("CLI.ts")
+			if err != nil {
+				return err
+			}
+			ctx.SetHeader("Content-Type", "application/typescript; charset=utf-8")
+			return bytes.ReplaceAll(cliTs, []byte("v{VERSION}"), []byte(fmt.Sprintf("v%d", VERSION)))
+		}
+
 		// ban malicious requests by banList
 		// trim the leading `/` in pathname to get the package name
 		// e.g. /@withfig/autocomplete -> @withfig/autocomplete
 		packageFullName := pathname[1:]
 		if cfg.BanList.IsPackageBanned(packageFullName) {
 			return rex.Status(403, "forbidden")
-		}
-
-		if strings.HasPrefix(ctx.R.UserAgent(), "Deno/") && pathname == "/" {
-			cliTs, err := embedFS.ReadFile("server/embed/deno_cli.ts")
-			if err != nil {
-				return err
-			}
-			ctx.SetHeader("Content-Type", "application/typescript; charset=utf-8")
-			return bytes.ReplaceAll(cliTs, []byte("v{VERSION}"), []byte(fmt.Sprintf("v%d", VERSION)))
 		}
 
 		external := newStringSet()
@@ -428,9 +442,9 @@ func esmHandler() rex.Handle {
 
 			// fetch non-js file from npmCDN and save it to fs
 			if err == storage.ErrNotFound {
-				resp, err := httpClient.Get(fmt.Sprintf("%s/%s", strings.TrimSuffix(cfg.NpmCDN, "/"), reqPkg.String()))
+				resp, err := httpClient.Get(fmt.Sprintf("%s/%s", cfg.NpmCDN, reqPkg.String()))
 				if err != nil && cfg.BackupNpmCDN != "" {
-					resp, err = httpClient.Get(fmt.Sprintf("%s/%s", strings.TrimSuffix(cfg.BackupNpmCDN, "/"), reqPkg.String()))
+					resp, err = httpClient.Get(fmt.Sprintf("%s/%s", cfg.BackupNpmCDN, reqPkg.String()))
 				}
 				if err != nil {
 					return rex.Status(500, err.Error())
@@ -510,10 +524,11 @@ func esmHandler() rex.Handle {
 				ctx.SetHeader("Cache-Control", "public, max-age=31536000, immutable")
 				if ctx.Form.Has("worker") && storageType == "builds" {
 					defer r.Close()
-					code, err := ioutil.ReadAll(r)
+					buf, err := ioutil.ReadAll(r)
 					if err != nil {
 						return rex.Status(500, err.Error())
 					}
+					code := bytes.TrimSuffix(buf, []byte(fmt.Sprintf(`//# sourceMappingURL=%s.map`, path.Base(savePath))))
 					ctx.SetHeader("Content-Type", "application/javascript; charset=utf-8")
 					return fmt.Sprintf(`export default function workerFactory(inject) { const blob = new Blob([%s, typeof inject === "string" ? "\n// inject\n" + inject : ""], { type: "application/javascript" }); return new Worker(URL.createObjectURL(blob), { type: "module" })}`, utils.MustEncodeJSON(string(code)))
 				}
@@ -675,7 +690,6 @@ func esmHandler() rex.Handle {
 					}
 					if submodule == pkgName+".css" {
 						submodule = ""
-						isPkgCss = true
 					}
 					// workaround for es5-ext weird "/#/" path
 					if pkgName == "es5-ext" {
@@ -810,18 +824,13 @@ func esmHandler() rex.Handle {
 			return []byte("export default null;\n")
 		}
 
-		if isPkgCss {
+		// redirect to package css from `?css`
+		if isPkgCss && reqPkg.Submodule == "" {
 			if !esm.PackageCSS {
 				return rex.Status(404, "Package CSS not found")
 			}
-
-			if !regexpFullVersionPath.MatchString(pathname) || !isPined || targetFromUA {
-				url := fmt.Sprintf("%s%s/%s.css", cdnOrigin, cfg.BasePath, strings.TrimSuffix(taskID, ".js"))
-				return rex.Redirect(url, http.StatusFound)
-			}
-
-			taskID = fmt.Sprintf("%s.css", strings.TrimSuffix(taskID, ".js"))
-			isBare = true
+			url := fmt.Sprintf("%s%s/%s.css", cdnOrigin, cfg.BasePath, strings.TrimSuffix(taskID, ".js"))
+			return rex.Redirect(url, http.StatusFound)
 		}
 
 		if isBare {
@@ -840,10 +849,11 @@ func esmHandler() rex.Handle {
 			ctx.SetHeader("Cache-Control", "public, max-age=31536000, immutable")
 			if isWorker && strings.HasSuffix(savePath, ".js") {
 				defer r.Close()
-				code, err := ioutil.ReadAll(r)
+				buf, err := ioutil.ReadAll(r)
 				if err != nil {
 					return rex.Status(500, err.Error())
 				}
+				code := bytes.TrimSuffix(buf, []byte(fmt.Sprintf(`//# sourceMappingURL=%s.map`, path.Base(savePath))))
 				ctx.SetHeader("Content-Type", "application/javascript; charset=utf-8")
 				return fmt.Sprintf(`export default function workerFactory() { const blob = new Blob([%s], { type: "application/javascript" }); return new Worker(URL.createObjectURL(blob), { type: "module" })}`, utils.MustEncodeJSON(string(code)))
 			}
